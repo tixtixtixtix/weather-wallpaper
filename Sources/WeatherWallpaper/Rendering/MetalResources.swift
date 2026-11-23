@@ -22,15 +22,11 @@ final class MetalResources {
     static let shared: Result<MetalResources, Error> = Result { try MetalResources() }
     let device: MTLDevice
     let queue: MTLCommandQueue
-    let skyPipeline: MTLRenderPipelineState
     let particlePipeline: MTLRenderPipelineState
     let rainCompositePipeline: MTLRenderPipelineState
     let lensPipeline: MTLRenderPipelineState
-    let emissionPipeline: MTLRenderPipelineState
-    let cloudPipeline: MTLRenderPipelineState
     let lightningPipeline: MTLRenderPipelineState
     let lightningEmissionPipeline: MTLRenderPipelineState
-    let cloudAtlas: MTLTexture
     let moonAlbedo: MTLTexture
     let blackTexture: MTLTexture
     let noiseVolume: MTLTexture
@@ -46,7 +42,49 @@ final class MetalResources {
     let cloudLightDepthPipeline: MTLComputePipelineState
     let emptyLightDepth: MTLTexture
     private let library: MTLLibrary
+    private let bundle: Bundle
     let cloudHistoryBudget = CloudHistoryBudget()
+
+    /// Legacy sky resources load on demand so shipping hybrid mode avoids ~12.6 MiB of unused VRAM and startup shader compiles.
+    lazy var cloudAtlas: MTLTexture = {
+        guard let url = bundle.url(forResource: "CloudAtlas", withExtension: "png") else { return blackTexture }
+        let loader = MTKTextureLoader(device: device)
+        return (try? loader.newTexture(URL: url, options: [.SRGB: false, .generateMipmaps: true,
+                                                           .textureStorageMode: MTLStorageMode.private.rawValue])) ?? blackTexture
+    }()
+
+    lazy var skyPipeline: MTLRenderPipelineState = {
+        let sky = MTLRenderPipelineDescriptor()
+        sky.label = "Procedural atmosphere"
+        sky.vertexFunction = library.makeFunction(name: "skyVertex")
+        sky.fragmentFunction = library.makeFunction(name: "skyFragment")
+        sky.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+        return try! device.makeRenderPipelineState(descriptor: sky)
+    }()
+
+    lazy var emissionPipeline: MTLRenderPipelineState = {
+        let emission = MTLRenderPipelineDescriptor()
+        emission.label = "Quarter-resolution HDR light"
+        emission.vertexFunction = library.makeFunction(name: "skyVertex")
+        emission.fragmentFunction = library.makeFunction(name: "emissionFragment")
+        emission.colorAttachments[0].pixelFormat = .rgba16Float
+        return try! device.makeRenderPipelineState(descriptor: emission)
+    }()
+
+    lazy var cloudPipeline: MTLRenderPipelineState = {
+        let clouds = MTLRenderPipelineDescriptor()
+        clouds.label = "Instanced cloud formations"
+        clouds.vertexFunction = library.makeFunction(name: "cloudVertex")
+        clouds.fragmentFunction = library.makeFunction(name: "cloudFragment")
+        let cloudAttachment = clouds.colorAttachments[0]!
+        cloudAttachment.pixelFormat = .bgra8Unorm_srgb
+        cloudAttachment.isBlendingEnabled = true
+        cloudAttachment.sourceRGBBlendFactor = .one
+        cloudAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        cloudAttachment.sourceAlphaBlendFactor = .one
+        cloudAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        return try! device.makeRenderPipelineState(descriptor: clouds)
+    }()
     // Only the opt-in prototype compiles these pipelines. Never compile per frame.
     lazy var cloudHistoryPipelines: Result<CloudHistoryPipelines,Error> = Result {
         func pipeline(_ name: String, depth: Bool, volume: Bool = true) throws -> MTLRenderPipelineState {
@@ -88,6 +126,7 @@ final class MetalResources {
         #else
         let bundle = Bundle.main
         #endif
+        self.bundle = bundle
         let library: MTLLibrary
         if let compiled = try? device.makeDefaultLibrary(bundle: bundle) {
             library = compiled
@@ -122,7 +161,6 @@ final class MetalResources {
             return try loader.newTexture(URL: url, options: [.SRGB: srgb, .generateMipmaps: true,
                                                               .textureStorageMode: MTLStorageMode.private.rawValue])
         }
-        cloudAtlas = try texture("CloudAtlas", extension: "png", srgb: false)
         moonAlbedo = try texture("MoonAlbedo", extension: "jpg", srgb: true)
         let black = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
         black.storageMode = device.hasUnifiedMemory ? .shared : .managed
@@ -205,33 +243,6 @@ final class MetalResources {
         command.waitUntilCompleted() // Once at resource creation, never in the animation loop.
         if let error = command.error { throw error }
         noiseVolume = noise
-
-        let sky = MTLRenderPipelineDescriptor()
-        sky.label = "Procedural atmosphere"
-        sky.vertexFunction = library.makeFunction(name: "skyVertex")
-        sky.fragmentFunction = library.makeFunction(name: "skyFragment")
-        sky.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
-        skyPipeline = try device.makeRenderPipelineState(descriptor: sky)
-
-        let emission = MTLRenderPipelineDescriptor()
-        emission.label = "Quarter-resolution HDR light"
-        emission.vertexFunction = library.makeFunction(name: "skyVertex")
-        emission.fragmentFunction = library.makeFunction(name: "emissionFragment")
-        emission.colorAttachments[0].pixelFormat = .rgba16Float
-        emissionPipeline = try device.makeRenderPipelineState(descriptor: emission)
-
-        let clouds = MTLRenderPipelineDescriptor()
-        clouds.label = "Instanced cloud formations"
-        clouds.vertexFunction = library.makeFunction(name: "cloudVertex")
-        clouds.fragmentFunction = library.makeFunction(name: "cloudFragment")
-        let cloudAttachment = clouds.colorAttachments[0]!
-        cloudAttachment.pixelFormat = .bgra8Unorm_srgb
-        cloudAttachment.isBlendingEnabled = true
-        cloudAttachment.sourceRGBBlendFactor = .one
-        cloudAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        cloudAttachment.sourceAlphaBlendFactor = .one
-        cloudAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        cloudPipeline = try device.makeRenderPipelineState(descriptor: clouds)
 
         func lightningPipeline(format: MTLPixelFormat, fragment: String) throws -> MTLRenderPipelineState {
             let descriptor = MTLRenderPipelineDescriptor()

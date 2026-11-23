@@ -61,6 +61,8 @@ final class SceneEnvironment {
 
     func animationTime(at time: TimeInterval) -> TimeInterval { motionSeconds(at: time) }
 
+    func isTransitioning(at time: TimeInterval) -> Bool { transition.isActive(at: time) }
+
     private func motionSeconds(at time: TimeInterval) -> TimeInterval {
         clockElapsed + (policy.animated && !policy.suspended ? time - clockAnchor : 0)
     }

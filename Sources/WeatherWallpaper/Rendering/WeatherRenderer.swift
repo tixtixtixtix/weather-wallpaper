@@ -163,6 +163,9 @@ final class WeatherRenderer: NSObject, MTKViewDelegate {
     private var widgetCache = WidgetRainLayoutCache()
     private let moonlitHaze: Bool
     private var hazeTransition = NotchHazeTransition()
+    private var lastRenderedUptime: TimeInterval = 0
+    private var forceNextDraw = true
+    private var hasDrawnOnce = false
 
     init(view: MTKView, environment: SceneEnvironment, moonlitHaze: Bool = false) throws {
         self.view = view
@@ -204,12 +207,34 @@ final class WeatherRenderer: NSObject, MTKViewDelegate {
         view.preferredFramesPerSecond = policy.framesPerSecond
         resize(view)
         let visible = view.window?.occlusionState.contains(.visible) == true && !view.isHiddenOrHasHiddenAncestor
-        view.isPaused = !policy.animated || policy.suspended || !visible
-        if !policy.suspended && visible { view.draw() }
+        let paused = !policy.animated || policy.suspended || !visible
+        view.isPaused = paused
+        forceNextDraw = true
+        if !policy.suspended && visible && (paused || !hasDrawnOnce) { view.draw() }
         if policy.suspended || !visible {
+            hasDrawnOnce = false
             view.releaseDrawables()
             compositor.releaseTransientResources()
         }
+    }
+
+    /// Adaptive pacing keeps precipitation, lightning, meteors, and transitions at full
+    /// rate while skipping redundant GPU frames on calm clear/dry skies.
+    static func targetFrameInterval(scene: SceneState, policy: RenderPolicy,
+                                    transitioning: Bool, meteorActive: Bool) -> TimeInterval {
+        guard policy.animated, !policy.suspended else { return 0 }
+        if transitioning || meteorActive || policy.showsWidgetGuide
+            || scene.rain > 0.001 || scene.snow > 0.001 || scene.storm > 0.001 {
+            return 0
+        }
+        let appearance = CloudAppearance(scene: scene)
+        let hasClouds = appearance.volumeCoverage > 0.075
+            || appearance.cirrus > 0.001
+            || appearance.presentation.convection.x > 0.001
+        if !hasClouds && scene.solar.daylight <= 0.01 && scene.solar.twilight <= 0.01 {
+            return 1.0 / 6.0
+        }
+        return 1.0 / 15.0
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -227,25 +252,32 @@ final class WeatherRenderer: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         guard !stopped, !environment.policy.suspended,
                !view.isHiddenOrHasHiddenAncestor,
-              view.window?.occlusionState.contains(.visible) == true,
-              inFlight.wait(timeout: .now()) == .success else { return }
+              view.window?.occlusionState.contains(.visible) == true else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let scene = environment.scene(at: now)
+        let policy = environment.policy
+        let seconds = environment.animationTime(at: now)
+        let meteor = policy.animated && !policy.suspended && policy.permitsMeteors && scene.solar.daylight < 0.1
+            ? MeteorAppearance.sample(at: seconds, aspect: Float(view.drawableSize.width / max(1, view.drawableSize.height)),
+                                       speed: policy.meteorSpeed) : nil
+        let transitioning = environment.isTransitioning(at: now)
+            || (moonlitHaze && hazeTransition.isTransitioning(at: seconds))
+        let interval = Self.targetFrameInterval(scene: scene, policy: policy,
+                                                transitioning: transitioning, meteorActive: meteor != nil)
+        if !forceNextDraw && interval > 0 && now - lastRenderedUptime < interval * 0.92 {
+            return
+        }
+        guard inFlight.wait(timeout: .now()) == .success else { return }
         var committed = false
         defer { if !committed { inFlight.signal() } }
         guard let drawable = view.currentDrawable,
                let buffer = resources.queue.makeCommandBuffer() else { return }
         buffer.label = environment.renderLabel
-        let now = ProcessInfo.processInfo.systemUptime
-        let scene = environment.scene(at: now)
-        let policy = environment.policy
-        let seconds = environment.animationTime(at: now)
         let uniforms = ShaderUniforms(
             scene: scene, size: view.drawableSize, seconds: seconds,
             wind: environment.windOffset(at: now, scene: scene), policy: policy,
             strike: environment.lightningSample(at: now, scene: scene)
         )
-        let meteor = policy.animated && !policy.suspended && policy.permitsMeteors && scene.solar.daylight < 0.1
-            ? MeteorAppearance.sample(at: seconds, aspect: Float(view.drawableSize.width / view.drawableSize.height),
-                                       speed: policy.meteorSpeed) : nil
         var haze = MoonlitHazeUniforms.disabled
         if moonlitHaze {
             let state = hazeTransition.value(configuration: policy.notchHaze,at: seconds,animated: policy.animated && !policy.suspended)
@@ -255,11 +287,15 @@ final class WeatherRenderer: NSObject, MTKViewDelegate {
                            framesPerSecond: policy.framesPerSecond,animated: policy.animated && !policy.suspended,
                             widget: widgetCache.uniforms(areas: policy.widgetRainAreas,screenHeight: Float(view.bounds.height),
                                 guide: policy.showsWidgetGuide,animated: policy.animated && !policy.suspended),
-                            haze: haze)
+                            haze: haze,
+                            allowCloudReuse: policy.animated && !policy.suspended && !transitioning)
         let semaphore = inFlight
         buffer.addCompletedHandler { _ in semaphore.signal() }
         buffer.present(drawable)
         buffer.commit()
         committed = true
+        lastRenderedUptime = now
+        forceNextDraw = false
+        hasDrawnOnce = true
     }
 }

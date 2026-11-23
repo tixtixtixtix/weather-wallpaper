@@ -347,6 +347,43 @@ final class RenderingTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveCloudCadenceReuseSkipsRedundantPassesAndInvalidatesOnChange() throws {
+        guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
+        let resources = try MetalResources.shared.get()
+        let comp = SceneCompositor(resources: resources, useLightCache: false, useCloudHistory: false)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb,
+                                                                 width: 640, height: 400, mipmapped: false)
+        descriptor.storageMode = .private
+        descriptor.usage = [.renderTarget]
+        let target = try XCTUnwrap(resources.device.makeTexture(descriptor: descriptor))
+        let scene = SceneState.preview(kind: .rain, time: .day)
+        let size = CGSize(width: 640, height: 400)
+        let policy = RenderPolicy()
+
+        func encodeFrame(seconds: Double, strike: LightningSample = LightningSample(), allowReuse: Bool = true) throws {
+            let cmd = try XCTUnwrap(resources.queue.makeCommandBuffer())
+            let uniforms = ShaderUniforms(scene: scene, size: size, seconds: seconds,
+                                          wind: seconds * Double(scene.wind * scene.windDirection),
+                                          policy: policy, strike: strike)
+            comp.encode(into: target, buffer: cmd, uniforms: uniforms, animated: true, allowCloudReuse: allowReuse)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            XCTAssertEqual(cmd.status, .completed)
+        }
+
+        try encodeFrame(seconds: 10.0)
+        XCTAssertEqual(comp.cloudReuseCount, 0)
+        try encodeFrame(seconds: 10.0 + 1.0 / 30.0)
+        XCTAssertEqual(comp.cloudReuseCount, 1, "Adjacent 30 fps frame should reuse steady cloudTarget")
+        try encodeFrame(seconds: 10.0 + 2.0 / 30.0)
+        XCTAssertEqual(comp.cloudReuseCount, 1, "Cloud target refreshes on cadence interval")
+        try encodeFrame(seconds: 10.0 + 3.0 / 30.0, strike: LightningSample(origin: 0.5, seed: 1, intensity: 0.8, reach: 0.9))
+        XCTAssertEqual(comp.cloudReuseCount, 1, "Active lightning must invalidate cloud reuse")
+        try encodeFrame(seconds: 10.0 + 4.0 / 30.0, allowReuse: false)
+        XCTAssertEqual(comp.cloudReuseCount, 1, "Deterministic encode must not reuse")
+    }
+
+    @MainActor
     func testRendererOptimizationsPreserveThePreviousImages() async throws {
         guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal unavailable") }
         let resources = try MetalResources.shared.get()

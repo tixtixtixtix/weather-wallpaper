@@ -367,12 +367,23 @@ float4 rainWidgetImpact(RainDrop drop, constant Uniforms &u, constant WidgetRain
         if (rect.y >= firstY) continue;
         float radius = min(layout.areas[i].options.x,min(rect.z*u.viewport.w,rect.w)*0.5);
         float y = rect.y, x = 0;
+        float invAspect = 1 / u.viewport.w;
+        float leftInner = rect.x + radius * invAspect;
+        float rightInner = rect.x + rect.z - radius * invAspect;
+        float radiusSq = radius * radius;
         for (uint iteration = 0; iteration < 3; ++iteration) {
+            float prevY = y;
             float age = (drop.center.y+drop.size.y*0.7-y)/drop.speed;
             x = fract(drop.seed+windPhase(0.018,u)-wind*1.35*0.018*age+y*wind*0.055
                 +sin(drop.phase-0.8*age)*0.002)*1.2-0.1;
-            float dx = max(0.0,max(rect.x+radius/u.viewport.w-x,x-(rect.x+rect.z-radius/u.viewport.w)))*u.viewport.w;
-            y = rect.y+radius-sqrt(max(0.0,radius*radius-dx*dx));
+            float dx = max(0.0,max(leftInner-x,x-rightInner))*u.viewport.w;
+            y = rect.y+radius-sqrt(max(0.0,radiusSq-dx*dx));
+            if (y == prevY) break;
+            if (iteration == 0) {
+                float dAge = radius / drop.speed;
+                float margin = (abs(wind) * (1.35 * 0.018 * dAge + 0.055 * radius) + 0.0016 * dAge) * 1.2 + 0.001;
+                if (x > -0.1 + margin && x < 1.1 - margin && (x < rect.x - margin || x > rect.x + rect.z + margin)) break;
+            }
         }
         if (x >= rect.x && x <= rect.x+rect.z && y < firstY) { firstY = y; firstX = x; }
     }
@@ -475,7 +486,7 @@ vertex RainCompositeVertex rainCompositeVertex(uint id [[vertex_id]]) {
     return {float4(p,0,1),float2((p.x+1)*0.5,(1-p.y)*0.5)};
 }
 fragment float4 rainCompositeFragment(RainCompositeVertex in [[stage_in]],texture2d<float> scene [[texture(0)]]) {
-    return scene.sample(artwork,in.uv);
+    return scene.read(uint2(in.position.xy));
 }
 
 struct LensVertex {

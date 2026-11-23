@@ -100,7 +100,7 @@ float3 cloudWindV2(constant AtmosphereUniforms &u, float scale) {
         + boundedPhase(u.clock.x, u.viewport.z, 0.000162 * scale), 0, 0);
 }
 struct VolumeShapeSettings {
-    float base, inverseDepth;
+    float base, depth, inverseDepth, ceiling, towerMaxHeight;
     float3 frequency, wind, macroWind;
     float macroWeight, threshold, topTaper, erosion, detailFrequency, densityGain, lod, distanceSparsity;
     float towerMass, summitSpread, deckCoverage, towerStepLOD, cumulusAmount, densityWidth;
@@ -111,7 +111,8 @@ struct VolumeShapeSettings {
 VolumeShapeSettings volumeSettings(constant AtmosphereUniforms &u) {
     // Uniform-only work is explicit and outside all three density probes in the ray loop.
     VolumeShapeSettings s;
-    s.base = u.morphology.x; s.inverseDepth = 1 / u.morphology.y;
+    s.base = u.morphology.x; s.depth = u.morphology.y; s.inverseDepth = 1 / u.morphology.y;
+    s.ceiling = s.base + s.depth; s.towerMaxHeight = 0;
     // Broad horizontal parent lobes and smaller vertical features, not upright cells.
     s.frequency = (u.rendering.z > 1.5 ? float3(0.035,0.12,0.035) : float3(0.13,0.16,0.13)) * u.morphology.z;
     // Store one world-space displacement; each frequency samples the same transported sky.
@@ -152,6 +153,7 @@ VolumeShapeSettings volumeSettings(constant AtmosphereUniforms &u) {
                                 (1.65+index*0.18)*1.35*(0.90+seed.z*0.20));
             s.towerInverse[i] = float2(u.towerMetrics[i+2],1/s.towers[i].w);
         }
+        s.towerMaxHeight = max(s.towers[0].z,s.towers[1].z);
     }
     return s;
 }
@@ -172,14 +174,6 @@ float deckDensityV2(float3 p, thread const VolumeShapeSettings &s, texture3d<flo
     // The macro slice drifts with height so large-scale structure can't terrace into
     // horizontal bands when the ray marches through the slab.
     float macro = noise.sample(volumeSampler,float3(p.x * 0.027,0.24 + p.y * 0.05,p.z * 0.027) + s.macroWind,level(1)).r;
-    float3 warp = float3(macro - 0.5,0,(macro - 0.5) * 0.7) * 0.12;
-    float2 body = noise.sample(volumeSampler,(p + s.wind) * s.frequency + warp + float3(0.37,0.12,0.29),level(s.lod)).rg;
-    // Reuse already-fetched shape channels for broad underside relief, not extra noise work.
-    structure = body.g * 0.45 + macro * 0.55;
-    float shape = mix(body.r,macro,s.macroWeight);
-    // Reuse the second body channel to vary the parent outline. Shadow probes
-    // see this same irregular mass without another texture lookup per probe.
-    shape += (body.g-0.5)*0.12*s.cumulusAmount;
     float threshold = s.threshold+s.cumulusAmount*0.018;
     // Flat condensation base, sculpted tops; wet banks fill in instead of scaling stamps.
     threshold += height * height * s.topTaper * (1+s.cumulusAmount*(0.5-macro));
@@ -189,6 +183,16 @@ float deckDensityV2(float3 p, thread const VolumeShapeSettings &s, texture3d<flo
     if (s.distanceSparsity > 0.001) {
         threshold += smoothstep(36.0,400.0,dot(p,p)) * s.distanceSparsity * (0.10+(1-macro)*0.08);
     }
+    // Exact upper bound: body.rg are normalized in [0,1]. Skip the body fetch in empty air.
+    if (mix(1.0,macro,s.macroWeight) + 0.06*s.cumulusAmount <= threshold) return 0;
+    float3 warp = float3(macro - 0.5,0,(macro - 0.5) * 0.7) * 0.12;
+    float2 body = noise.sample(volumeSampler,(p + s.wind) * s.frequency + warp + float3(0.37,0.12,0.29),level(s.lod)).rg;
+    // Reuse already-fetched shape channels for broad underside relief, not extra noise work.
+    structure = body.g * 0.45 + macro * 0.55;
+    float shape = mix(body.r,macro,s.macroWeight);
+    // Reuse the second body channel to vary the parent outline. Shadow probes
+    // see this same irregular mass without another texture lookup per probe.
+    shape += (body.g-0.5)*0.12*s.cumulusAmount;
     float density = max(0.0, shape - threshold);
     if (density <= 0) return 0;
     // Optical-depth probes integrate coarse mass; unresolved erosion does not need
@@ -292,8 +296,8 @@ float cloudDensityV2(float3 p, thread const VolumeShapeSettings &s, texture3d<fl
 float cloudLightDepth(float3 p, float3 toLight, thread const VolumeShapeSettings &s,
                        texture3d<float> noise, uint samples, float towerAmount = 0) {
     if (toLight.y <= 0.001) return 12.0;
-    float ceiling = s.base + 1 / s.inverseDepth;
-    if (s.towerMass > 0.001) ceiling = mix(ceiling,max(ceiling,s.base+max(s.towers[0].z,s.towers[1].z)),towerAmount);
+    float ceiling = s.ceiling;
+    if (s.towerMass > 0.001) ceiling = mix(ceiling,max(ceiling,s.base+s.towerMaxHeight),towerAmount);
     // Shorter surface probes resolve the tower billows instead of reducing every
     // interior to the same flat self-shadow; multiple scattering supplies deep fill.
     // Local tower contribution, not a scene-wide switch: adding a distant tower
@@ -349,7 +353,8 @@ float sampleCloudLight(float3 p, float3 toLight, thread const VolumeShapeSetting
 float cloudPhase(float cosine) {
     // HG relative to isotropic scattering (4*pi convention), bounded broad fill.
     float g = 0.58;
-    float forward = (1 - g*g) / pow(max(0.01,1 + g*g - 2*g*cosine),1.5);
+    float denom = max(0.01,1 + g*g - 2*g*cosine);
+    float forward = (1 - g*g) / (denom * sqrt(denom));
     return 0.70 + 0.30 * forward;
 }
 
@@ -589,37 +594,40 @@ inline __attribute__((always_inline)) float4 integrateCloudsV2(float2 uv, float2
             float density = cloudDensityV2(p,settings,noise,structure,towerAmount,true) * (1 - smoothstep(40.0,64.0,distance));
             // Retain the established small-mass early-out in nearly empty samples.
             if (density < 0.002) continue;
-            float depth = 1 / settings.inverseDepth;
-            if (settings.towerMass > 0.001) depth = mix(depth,max(depth,max(settings.towers[0].z,settings.towers[1].z)),towerAmount);
-            float h = saturate((p.y - settings.base) / depth);
-            float opticalDepth = sampleCloudLight(p,direction,settings,noise,lightDepth,u,lightSamples,towerAmount) * extinction;
-            float direct = exp(-opticalDepth);
-            float multiple = 0.14 * exp(-opticalDepth * 0.22);
-            float billowing = max(settings.cumulusAmount,towerAmount);
-            float skyAccess = mix(0.38,0.30,billowing) + mix(0.62,0.70,billowing)*sqrt(h);
-            // Local lighting is stored in half precision to reduce Apple GPU register
-            // pressure. Density, optical depth, transmittance and accumulation stay float.
-            half3 light = mix(ambient,towerAmbient,half(towerAmount)) * half(skyAccess)
-                + directColor * half(direct * phase + multiple);
-            light *= half(lightGain);
-            // A restrained tonal ceiling remains visible even when the slab is opaque.
-            // No extra puff layers, texture samples, targets or full-screen noise octaves.
-            light *= half(1 + (structure-0.5)*1.55*max(bankDetail,max(settings.cumulusAmount*0.65,towerAmount*0.85)));
-            // Restrained silver lining: only thin, directly lit density facing
-            // the source. No screen-space outline, extra gradient probes or pass.
-            float lining = (1-saturate(density*0.35))*direct*max(0.0,phase-1.0)*0.16
-                * billowing * (0.25+0.75*h);
-            light += directColor*half(lining);
-            light += flashLight;
-            // Distance haze softens remote cloud banks without blurring foreground edges.
-            // Keep close billows crisp/contrasty, while distant decks and remote
-            // towers settle into the atmosphere. Same single analytic haze term.
-            float hazeDistance = max(0.0,distance-2*settings.cumulusAmount*(1-towerAmount));
-            float haze = 1-exp(-hazeDistance*mix(mix(0.11,0.10,settings.cumulusAmount),0.026,towerAmount));
-            light = mix(light,scatteredHorizon,half(haze));
             float alpha = 1 - exp(-density * stepLength * extinction);
-            radiance += transmittance * alpha * float3(light);
-            if (captureDepth) meanDepth += transmittance * alpha * distance;
+            float weight = transmittance * alpha;
+            if (weight >= 0.0002) {
+                float depth = settings.depth;
+                if (settings.towerMass > 0.001) depth = mix(depth,max(depth,settings.towerMaxHeight),towerAmount);
+                float h = saturate((p.y - settings.base) / depth);
+                float opticalDepth = sampleCloudLight(p,direction,settings,noise,lightDepth,u,lightSamples,towerAmount) * extinction;
+                float direct = exp(-opticalDepth);
+                float multiple = 0.14 * exp(-opticalDepth * 0.22);
+                float billowing = max(settings.cumulusAmount,towerAmount);
+                float skyAccess = mix(0.38,0.30,billowing) + mix(0.62,0.70,billowing)*sqrt(h);
+                // Local lighting is stored in half precision to reduce Apple GPU register
+                // pressure. Density, optical depth, transmittance and accumulation stay float.
+                half3 light = mix(ambient,towerAmbient,half(towerAmount)) * half(skyAccess)
+                    + directColor * half(direct * phase + multiple);
+                light *= half(lightGain);
+                // A restrained tonal ceiling remains visible even when the slab is opaque.
+                // No extra puff layers, texture samples, targets or full-screen noise octaves.
+                light *= half(1 + (structure-0.5)*1.55*max(bankDetail,max(settings.cumulusAmount*0.65,towerAmount*0.85)));
+                // Restrained silver lining: only thin, directly lit density facing
+                // the source. No screen-space outline, extra gradient probes or pass.
+                float lining = (1-saturate(density*0.35))*direct*max(0.0,phase-1.0)*0.16
+                    * billowing * (0.25+0.75*h);
+                light += directColor*half(lining);
+                light += flashLight;
+                // Distance haze softens remote cloud banks without blurring foreground edges.
+                // Keep close billows crisp/contrasty, while distant decks and remote
+                // towers settle into the atmosphere. Same single analytic haze term.
+                float hazeDistance = max(0.0,distance-2*settings.cumulusAmount*(1-towerAmount));
+                float haze = 1-exp(-hazeDistance*mix(mix(0.11,0.10,settings.cumulusAmount),0.026,towerAmount));
+                light = mix(light,scatteredHorizon,half(haze));
+                radiance += weight * float3(light);
+            }
+            if (captureDepth) meanDepth += weight * distance;
             transmittance *= 1 - alpha;
             if (transmittance < 0.012) break;
         }
@@ -632,7 +640,7 @@ inline __attribute__((always_inline)) float4 integrateCloudsV2(float2 uv, float2
         // Elevated ice remains sunlit briefly at twilight, but never glows on a
         // moonless dark night. Restrained source-aligned forward scattering.
         iceLight = mix(iceLight,float3(0.78,0.40,0.30),twilight * 0.65);
-        iceLight *= 0.85 + 0.15 * cloudPhase(dot(ray,direction));
+        iceLight *= 0.85 + 0.15 * phase;
         radiance += transmittance * cirrus * iceLight;
         transmittance *= 1 - cirrus;
     }
@@ -890,58 +898,71 @@ fragment float4 atmosphereComposite(SolarAtmosphereVertex in [[stage_in]], const
                                     texture2d<float> clouds [[texture(3)]],texture3d<float> hazeNoise [[texture(4)]]) {
     float2 uv = in.uv;
     float day = u.atmosphere.x, twilight = u.atmosphere.y;
-    // A high transparent veil is not the same optical regime as an opaque low ceiling.
-    float overcast = smoothstep(0.50,1.0,u.cloudStructure.z);
-    float3 zenith = mix(float3(0.0012,0.0028,0.010),float3(0.008,0.13,0.46),day);
-    float3 horizon = mix(float3(0.012,0.021,0.048),float3(0.25,0.53,0.83),day);
-    zenith = mix(zenith,mix(float3(0.008,0.013,0.025),float3(0.13,0.20,0.29),day),overcast);
-    horizon = mix(horizon,mix(float3(0.023,0.032,0.049),float3(0.39,0.47,0.55),day),overcast);
-    zenith = mix(zenith,float3(0.055,0.041,0.13),twilight * 0.80);
-    horizon = mix(horizon,float3(1.05,0.29,0.11),twilight * (1 - overcast * 0.65));
-    // Golden hour: warm the horizon when daylight is mid and the sun is low.
-    float golden = clamp(day * (1.0 - day) * 4.0, 0.0, 1.0) * (1.0 - twilight * 0.3);
-    horizon += float3(0.30,0.10,0.015) * golden * (1.0 - overcast * 0.6) * day;
-    // Blue hour: cool the zenith once the sun drops but twilight lingers.
-    float blue = (1.0 - day) * twilight;
-    zenith = mix(zenith, float3(0.020,0.050,0.120), blue * 0.45 * (1.0 - overcast * 0.5));
-    float horizonWeight = pow(saturate(uv.y),1.6);
-    float3 sky = mix(zenith,horizon,horizonWeight);
-    sky *= 1 - u.clouds.z * 0.16 - u.weather.z * 0.24;
-    float distance = length(celestialDeltaV2(uv,u.celestial.xy) * float2(u.viewport.w,1));
-    float3 sunlight = mix(float3(2.8,1.0,0.30),float3(2.8,2.55,2.05),day);
-    sky += sunlight * exp(-distance * 5) * day * 0.07 * (1 - overcast * 0.75) * u.moonLight.w;
-    float sunEdge = max(1 / u.viewport.y,0.0005);
-    if (distance < u.rendering.w + sunEdge) {
-        // The weather, not a passing light cloud, selects the plain white button.
-        // Final cloud compositing still attenuates or hides the physical disk.
-        float filtered = 1-u.moonLight.w;
-        float3 diskLight = mix(sunlight,float3(2.8),filtered);
-        sky += diskLight * (4 * (1+filtered*1.8))
-            * (1-smoothstep(u.rendering.w-sunEdge,u.rendering.w+sunEdge,distance)) * day;
+    bool hasClouds = u.cloudStructure.z > 0.075 || u.clouds.w > 0.001 || u.convection.x > 0.001;
+    float4 cloud = hasClouds ? clouds.sample(atmosphereSampler,uv) : float4(0);
+    float3 sky = float3(0);
+    if (cloud.a < 0.999) {
+        // A high transparent veil is not the same optical regime as an opaque low ceiling.
+        float overcast = smoothstep(0.50,1.0,u.cloudStructure.z);
+        half3 zenith = mix(half3(0.0012h,0.0028h,0.010h),half3(0.008h,0.13h,0.46h),half(day));
+        half3 horizon = mix(half3(0.012h,0.021h,0.048h),half3(0.25h,0.53h,0.83h),half(day));
+        zenith = mix(zenith,mix(half3(0.008h,0.013h,0.025h),half3(0.13h,0.20h,0.29h),half(day)),half(overcast));
+        horizon = mix(horizon,mix(half3(0.023h,0.032h,0.049h),half3(0.39h,0.47h,0.55h),half(day)),half(overcast));
+        zenith = mix(zenith,half3(0.055h,0.041h,0.13h),half(twilight * 0.80));
+        horizon = mix(horizon,half3(1.05h,0.29h,0.11h),half(twilight * (1 - overcast * 0.65)));
+        // Golden hour: warm the horizon when daylight is mid and the sun is low.
+        float golden = clamp(day * (1.0 - day) * 4.0, 0.0, 1.0) * (1.0 - twilight * 0.3);
+        horizon += half3(0.30h,0.10h,0.015h) * half(golden * (1.0 - overcast * 0.6) * day);
+        // Blue hour: cool the zenith once the sun drops but twilight lingers.
+        float blue = (1.0 - day) * twilight;
+        zenith = mix(zenith, half3(0.020h,0.050h,0.120h), half(blue * 0.45 * (1.0 - overcast * 0.5)));
+        float horizonWeight = pow(saturate(uv.y),1.6);
+        sky = float3(mix(zenith,horizon,half(horizonWeight))) * (1 - u.clouds.z * 0.16 - u.weather.z * 0.24);
+        if (day > 0.001) {
+            float distance = length(celestialDeltaV2(uv,u.celestial.xy) * float2(u.viewport.w,1));
+            float3 sunlight = mix(float3(2.8,1.0,0.30),float3(2.8,2.55,2.05),day);
+            if (u.moonLight.w > 0) {
+                sky += sunlight * exp(-distance * 5) * day * 0.07 * (1 - overcast * 0.75) * u.moonLight.w;
+            }
+            float sunEdge = max(1 / u.viewport.y,0.0005);
+            if (distance < u.rendering.w + sunEdge) {
+                // The weather, not a passing light cloud, selects the plain white button.
+                // Final cloud compositing still attenuates or hides the physical disk.
+                float filtered = 1-u.moonLight.w;
+                float3 diskLight = mix(sunlight,float3(2.8),filtered);
+                sky += diskLight * (4 * (1+filtered*1.8))
+                    * (1-smoothstep(u.rendering.w-sunEdge,u.rendering.w+sunEdge,distance)) * day;
+            }
+        }
+        float night = (1 - day) * (1 - twilight * 0.95);
+        if (night > 0.005) {
+            float moonWash = 1.0 - u.moon.z * u.celestial.z * 0.55;
+            sky += float3(0.62) * starFieldV2(uv,u) * (night * moonWash);
+        }
+        if (u.moon.z > 0.001) {
+            sky = moonSurfaceV2(uv,sky,u,moonMap);
+            if (night * u.moon.z * u.celestial.z > 0.0001) {
+                float moonDistance = length(celestialDeltaV2(uv,u.moon.xy) * float2(u.viewport.w,1));
+                sky += float3(0.008,0.014,0.028) * exp(-moonDistance * 55) * night * u.moon.z * u.celestial.z;
+            }
+        }
     }
-    float night = (1 - day) * (1 - twilight * 0.95);
-    if (night > 0.005) {
-        float moonWash = 1.0 - u.moon.z * u.celestial.z * 0.55;
-        sky += float3(0.62) * starFieldV2(uv,u) * (night * moonWash);
-    }
-    sky = moonSurfaceV2(uv,sky,u,moonMap);
-    if (night * u.moon.z * u.celestial.z > 0.0001) {
-        float moonDistance = length(celestialDeltaV2(uv,u.moon.xy) * float2(u.viewport.w,1));
-        sky += float3(0.008,0.014,0.028) * exp(-moonDistance * 55) * night * u.moon.z * u.celestial.z;
-    }
-    float4 cloud = clouds.sample(atmosphereSampler,uv);
     // Both inputs are scene-linear. Clouds attenuate celestial bodies and stars naturally.
     sky = sky * (1 - cloud.a) + cloud.rgb;
-    float haze = u.atmosphere.w * mix(0.25,0.92,pow(uv.y,0.9));
-    float3 fogLight = mix(float3(0.027,0.038,0.060),float3(0.43,0.51,0.60),day);
-    sky = mix(sky,fogLight,haze);
+    if (u.atmosphere.w > 0.0001) {
+        float haze = u.atmosphere.w * mix(0.25,0.92,pow(uv.y,0.9));
+        float3 fogLight = mix(float3(0.027,0.038,0.060),float3(0.43,0.51,0.60),day);
+        sky = mix(sky,fogLight,haze);
+    }
     if (u.lightning.z > 0.001) {
         float2 flashDelta = (uv - float2(u.lightning.x,0.24)) * float2(u.viewport.w,1);
         sky += float3(0.035,0.050,0.09) * u.lightning.z * exp(-dot(flashDelta,flashDelta) * 3);
     }
     if (u.options.w > 0.5) {
-        sky += bloom.sample(atmosphereSampler,uv).rgb * 0.48;
         float visibility = in.sunVisibility;
+        if (visibility > 0 || u.lightning.z > 0.001) {
+            sky += bloom.sample(atmosphereSampler,uv).rgb * 0.48;
+        }
         if (visibility > 0) {
             // Keep a slender feathered blade inside the same final pass, so the
             // bloom blur cannot turn all six rays back into chunky hazy prongs.
@@ -949,8 +970,8 @@ fragment float4 atmosphereComposite(SolarAtmosphereVertex in [[stage_in]], const
             if (dot(delta,delta) < 0.21*0.21) {
                 sky += solarGlareTintV2(length(delta),u)*solarDiffractionV2(delta,u)*(0.25*visibility);
             }
+            sky += lensFlareV2(uv,u,visibility);
         }
-        sky += lensFlareV2(uv,u,visibility);
     }
     // One photographic shoulder after atmosphere, cloud and source-occluded optical effects.
     float3 color = 1 - exp(-max(0.0,sky));
@@ -964,8 +985,10 @@ fragment float4 atmosphereComposite(SolarAtmosphereVertex in [[stage_in]], const
     hash = (hash ^ (hash >> 15)) * 0x846ca68bu;
     float a = float(hash & 65535u) / 65535.0;
     float b = float((hash >> 16) & 65535u) / 65535.0;
-    float3 inverseSlope = select(float3(1.0/12.92),(2.4/1.055) * pow(color,1.0 - 1.0/2.4),color > 0.0031308);
-    return float4(saturate(color + inverseSlope * ((a-b) * (0.5/255.0))),1);
+    half3 hc = half3(color);
+    half3 root = sqrt(hc);
+    half3 inverseSlope = select(half3(1.0h/12.92h), half3(2.4h/1.055h) * (root * mix(half3(0.72h), half3(1.0h), root)), hc > 0.0031308h);
+    return float4(saturate(color + float3(inverseSlope) * ((a-b) * (0.5/255.0))),1);
 }
 
 // One tiny instanced quad per active meteor. No full-screen event work or bloom target.

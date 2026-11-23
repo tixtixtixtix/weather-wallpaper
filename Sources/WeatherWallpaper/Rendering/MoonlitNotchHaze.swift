@@ -50,6 +50,11 @@ struct NotchHazeTransition {
         return current
     }
 
+    func isTransitioning(at seconds: TimeInterval) -> Bool {
+        guard let target, start != target else { return false }
+        return seconds >= began && seconds - began < duration
+    }
+
     private func interpolated(at seconds: TimeInterval) -> SIMD2<Float> {
         let progress = Float(min(1,max(0,(seconds-began)/duration)))
         let eased = progress*progress*(3-2*progress)

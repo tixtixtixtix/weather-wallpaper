@@ -5,14 +5,22 @@ import SwiftUI
 final class SkyMetalView: MTKView {
     var renderer: WeatherRenderer?
     private var windowObservation: NSObjectProtocol?
+    private var spaceObservation: NSObjectProtocol?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let windowObservation { NotificationCenter.default.removeObserver(windowObservation) }
         windowObservation = nil
+        if let spaceObservation { NSWorkspace.shared.notificationCenter.removeObserver(spaceObservation) }
+        spaceObservation = nil
         if let window {
             windowObservation = NotificationCenter.default.addObserver(
                 forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.renderer?.refreshPolicy() }
+            }
+            spaceObservation = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
             ) { [weak self] _ in
                 Task { @MainActor in self?.renderer?.refreshPolicy() }
             }
@@ -45,10 +53,13 @@ final class SkyMetalView: MTKView {
         renderer = nil
         if let windowObservation { NotificationCenter.default.removeObserver(windowObservation) }
         windowObservation = nil
+        if let spaceObservation { NSWorkspace.shared.notificationCenter.removeObserver(spaceObservation) }
+        spaceObservation = nil
     }
 
     deinit {
         if let windowObservation { NotificationCenter.default.removeObserver(windowObservation) }
+        if let spaceObservation { NSWorkspace.shared.notificationCenter.removeObserver(spaceObservation) }
     }
 }
 

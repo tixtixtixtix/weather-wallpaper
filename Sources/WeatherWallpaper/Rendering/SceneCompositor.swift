@@ -41,10 +41,14 @@ final class SceneCompositor {
     private var rainScene: MTLTexture?
     private var lightDepth: MTLTexture?
     private let permitsLightCache: Bool
+    private let usesBottomFadeScissor: Bool
     private let frameHistory: CloudFrameHistory?
     private var lightningBuffer: MTLBuffer?
     private var lightningCount = 0
     private var lightningKey: SIMD3<Float>?
+    private var cachedCloudUniforms: ShaderUniforms?
+    private var cachedCloudSize: (width: Int, height: Int)?
+    private(set) var cloudReuseCount = 0
 
     var allocatedTransientBytes: Int {
         [cloudTarget, emission, blurred, lightDepth, rainScene].compactMap { $0 }.reduce(0) { $0 + $1.allocatedSize }
@@ -83,12 +87,17 @@ final class SceneCompositor {
         quadPrimitive = usesQuadStrips ? .triangleStrip : .triangle
         quadVertexCount = usesQuadStrips ? 4 : 6
         permitsLightCache = useLightCache && cloudPipeline == nil
+        usesBottomFadeScissor = cloudPipeline == nil && convectiveCloudPipeline == nil && iceCloudPipeline == nil
         frameHistory = useCloudHistory && !useLightCache && cloudPipeline == nil ? CloudFrameHistory(resources: resources) : nil
-        for pass in [cloudPass,emissionPass,finalPass] {
+        for pass in [emissionPass,finalPass] {
             pass.colorAttachments[0].loadAction = .dontCare
             pass.colorAttachments[0].storeAction = .store
         }
-        cloudPass.colorAttachments[1].loadAction = .dontCare
+        cloudPass.colorAttachments[0].loadAction = .clear
+        cloudPass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        cloudPass.colorAttachments[0].storeAction = .store
+        cloudPass.colorAttachments[1].loadAction = .clear
+        cloudPass.colorAttachments[1].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         cloudPass.colorAttachments[1].storeAction = .store
         blur = MPSImageGaussianBlur(device: resources.device, sigma: 5)
         blur.edgeMode = .clamp
@@ -103,6 +112,8 @@ final class SceneCompositor {
         cloudTarget = nil
         rainScene = nil
         lightDepth = nil
+        cachedCloudUniforms = nil
+        cachedCloudSize = nil
         frameHistory?.invalidate()
         lightningBuffer = nil
         lightningCount = 0
@@ -138,15 +149,44 @@ final class SceneCompositor {
         encoder.setRenderPipelineState(emission ? resources.lightningEmissionPipeline : resources.lightningPipeline)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
         encoder.setVertexBuffer(lightningBuffer, offset: 0, index: 1)
-        encoder.setVertexTexture(resources.cloudAtlas, index: 0)
+        if uniforms.rendering.z < 0.5 {
+            encoder.setVertexTexture(resources.cloudAtlas, index: 0)
+            encoder.setFragmentTexture(resources.cloudAtlas, index: 0)
+        }
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
-        encoder.setFragmentTexture(resources.cloudAtlas, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: lightningCount)
+    }
+
+    private static func closeVector(_ a: SIMD4<Float>, _ b: SIMD4<Float>, tolerance: Float) -> Bool {
+        abs(a.x - b.x) <= tolerance && abs(a.y - b.y) <= tolerance
+            && abs(a.z - b.z) <= tolerance && abs(a.w - b.w) <= tolerance
+    }
+
+    private func canReuseCloudTarget(_ u: ShaderUniforms, width: Int, height: Int) -> Bool {
+        guard let cached = cachedCloudUniforms,
+              let size = cachedCloudSize, size.width == width, size.height == height else { return false }
+        let now = Double(u.clock.x) + Double(u.viewport.z)
+        let then = Double(cached.clock.x) + Double(cached.viewport.z)
+        let dt = now - then
+        let interval: Double = (u.weather.w < 0.25 && u.convection.x <= 0.001) ? (1.0 / 12.0) : (1.0 / 15.0)
+        guard dt > 0, dt < interval * 0.95,
+              u.viewport.x == cached.viewport.x, u.viewport.y == cached.viewport.y, u.viewport.w == cached.viewport.w,
+              u.rendering == cached.rendering, u.morphology == cached.morphology,
+              u.cloudStructure == cached.cloudStructure, u.upperStyle == cached.upperStyle,
+              u.clouds == cached.clouds, u.atmosphere == cached.atmosphere,
+              u.weather.x == cached.weather.x, u.weather.y == cached.weather.y, u.weather.z == cached.weather.z,
+              u.convection.x == cached.convection.x, u.convection.y == cached.convection.y,
+              u.lightning.z <= 0.001, cached.lightning.z <= 0.001,
+              Self.closeVector(u.celestial, cached.celestial, tolerance: 0.0005),
+              Self.closeVector(u.moon, cached.moon, tolerance: 0.0005),
+              Self.closeVector(u.moonLight, cached.moonLight, tolerance: 0.0005) else { return false }
+        return true
     }
 
     func encode(into texture: MTLTexture, buffer: MTLCommandBuffer, uniforms input: ShaderUniforms,
                 meteor: MeteorAppearance? = nil, framesPerSecond: Int = 30, animated: Bool = true,
-                widget: WidgetRainLayoutUniforms = .disabled, haze inputHaze: MoonlitHazeUniforms = .disabled) {
+                widget: WidgetRainLayoutUniforms = .disabled, haze inputHaze: MoonlitHazeUniforms = .disabled,
+                allowCloudReuse: Bool = false) {
         defer {
             // Reuse the descriptor objects, never retain drawables/retired targets.
             finalPass.colorAttachments[0].texture = nil
@@ -169,8 +209,14 @@ final class SceneCompositor {
                 descriptor.usage = [.renderTarget, .shaderRead]
                 cloudTarget = resources.device.makeTexture(descriptor: descriptor)
                 cloudTarget?.label = "Linear cloud scattering + opacity"
+                cachedCloudUniforms = nil
+                cachedCloudSize = nil
             }
             if let cloudTarget {
+                if allowCloudReuse && animated && frameHistory == nil && canReuseCloudTarget(uniforms, width: width, height: height) {
+                    cloudLayer = cloudTarget
+                    cloudReuseCount += 1
+                } else {
                 // Sparse skies don't amortize a 3D cache build. Reserve it for
                 // extensive decks; broken clouds keep exact bounded light probes.
                 if permitsLightCache && uniforms.cloudStructure.z >= 0.65 && uniforms.convection.x <= 0.001 {
@@ -203,10 +249,15 @@ final class SceneCompositor {
                 let pass = cloudPass
                 pass.colorAttachments[0].texture = destination
                 pass.colorAttachments[1].texture = historyReady && !reuse ? frameHistory?.depth : nil
-                pass.colorAttachments[0].loadAction = .dontCare
+                pass.colorAttachments[0].loadAction = .clear
                 pass.colorAttachments[0].storeAction = .store
                 if let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) {
                     encoder.label = reuse ? "Reproject fresh cloud history + reject unreliable pixels" : "Low-resolution cloud volume + distant cirrus"
+                    if usesBottomFadeScissor {
+                        // cloudBottomFade(uv.y) is identically zero for uv.y >= 0.84; skip fragment dispatch below it.
+                        let activeHeight = min(height, Int(ceil(Double(height) * 0.84)) + 1)
+                        encoder.setScissorRect(MTLScissorRect(x: 0, y: 0, width: width, height: activeHeight))
+                    }
                     if reuse, let frameHistory, var previous = frameHistory.previous {
                         encoder.setRenderPipelineState(frameHistory.depth == nil ? frameHistory.pipelines.reprojectIce : frameHistory.pipelines.reproject)
                         encoder.setFragmentBytes(&previous,length: MemoryLayout<ShaderUniforms>.stride,index: 1)
@@ -230,15 +281,25 @@ final class SceneCompositor {
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                     encoder.endEncoding()
                     cloudLayer = destination
+                    if destination === cloudTarget {
+                        cachedCloudUniforms = uniforms
+                        cachedCloudSize = (width, height)
+                    } else {
+                        cachedCloudUniforms = nil
+                        cachedCloudSize = nil
+                    }
                     if historyReady, let frameHistory {
                         if reuse { frameHistory.recordReuse() } else { frameHistory.recordFresh(uniforms) }
                         frameHistory.trackCompletion(of: buffer)
                     }
-                } else { frameHistory?.invalidate(); uniforms.rendering.z = 0 }
-            } else { frameHistory?.invalidate(); uniforms.rendering.z = 0 } // Keep the previous renderer as an allocation fallback.
+                } else { frameHistory?.invalidate(); cachedCloudUniforms = nil; cachedCloudSize = nil; uniforms.rendering.z = 0 }
+                }
+            } else { frameHistory?.invalidate(); cachedCloudUniforms = nil; cachedCloudSize = nil; uniforms.rendering.z = 0 } // Keep the previous renderer as an allocation fallback.
         } else {
             cloudTarget = nil
             lightDepth = nil
+            cachedCloudUniforms = nil
+            cachedCloudSize = nil
             frameHistory?.invalidate()
         }
         var light = resources.blackTexture
@@ -267,10 +328,12 @@ final class SceneCompositor {
                     encoder.label = "Visible sun / lightning emission"
                     encoder.setRenderPipelineState(uniforms.rendering.z > 0.5 ? atmosphereEmissionPipeline : resources.emissionPipeline)
                     encoder.setVertexBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
-                    encoder.setVertexTexture(resources.cloudAtlas, index: 0)
+                    if uniforms.rendering.z < 0.5 {
+                        encoder.setVertexTexture(resources.cloudAtlas, index: 0)
+                        encoder.setFragmentTexture(resources.cloudAtlas, index: 0)
+                    }
                     encoder.setVertexTexture(cloudLayer,index: 3)
                     encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
-                    encoder.setFragmentTexture(resources.cloudAtlas, index: 0)
                     encoder.setFragmentTexture(cloudLayer, index: 3)
                     encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                     drawLightning(encoder, uniforms: &uniforms, emission: true)
@@ -303,12 +366,14 @@ final class SceneCompositor {
         encoder.label = "Full-resolution atmosphere + photographic moon + GPU precipitation"
         encoder.setRenderPipelineState(uniforms.rendering.z > 0.5 ? atmospherePipeline : resources.skyPipeline)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
-        encoder.setVertexTexture(resources.cloudAtlas, index: 0)
+        if uniforms.rendering.z < 0.5 {
+            encoder.setVertexTexture(resources.cloudAtlas, index: 0)
+            encoder.setFragmentTexture(resources.cloudAtlas, index: 0)
+        }
         encoder.setVertexTexture(cloudLayer,index: 3)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ShaderUniforms>.stride, index: 0)
         var haze = inputHaze
         encoder.setFragmentBytes(&haze,length: MemoryLayout<MoonlitHazeUniforms>.stride,index: 3)
-        encoder.setFragmentTexture(resources.cloudAtlas, index: 0)
         encoder.setFragmentTexture(resources.moonAlbedo, index: 1)
         encoder.setFragmentTexture(light, index: 2)
         encoder.setFragmentTexture(cloudLayer, index: 3)
@@ -382,10 +447,6 @@ final class SceneCompositor {
                 var kind: UInt32 = 5
                 lens.setRenderPipelineState(particlePipeline)
                 lens.setVertexBytes(&kind,length: 4,index: 1)
-                widget.vectors.withUnsafeBytes { bytes in
-                    lens.setVertexBytes(bytes.baseAddress!,length: bytes.count,index: 2)
-                    lens.setFragmentBytes(bytes.baseAddress!,length: bytes.count,index: 2)
-                }
                 let impacts = max(4,Int(64*min(1,uniforms.weather.x)*pow(uniforms.options.x,2)))
                 lens.drawPrimitives(type: quadPrimitive,vertexStart: 0,vertexCount: quadVertexCount,instanceCount: impacts)
             }

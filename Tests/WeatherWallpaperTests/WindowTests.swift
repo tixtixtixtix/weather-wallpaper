@@ -89,6 +89,32 @@ final class WindowTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testAdaptiveFramePacingTargetsCalmSkiesAndRampsUpForMotion() {
+        var policy = RenderPolicy()
+        var clearNight = SceneState.preview(kind: .clear, time: .night)
+        clearNight.cloud = 0
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: clearNight, policy: policy,
+                                                           transitioning: false, meteorActive: false), 1.0 / 6.0, accuracy: 0.0001)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: clearNight, policy: policy,
+                                                           transitioning: false, meteorActive: true), 0)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: clearNight, policy: policy,
+                                                           transitioning: true, meteorActive: false), 0)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: .preview(kind: .clear, time: .day), policy: policy,
+                                                           transitioning: false, meteorActive: false), 1.0 / 15.0, accuracy: 0.0001)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: .preview(kind: .partlyCloudy, time: .day), policy: policy,
+                                                           transitioning: false, meteorActive: false), 1.0 / 15.0, accuracy: 0.0001)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: .preview(kind: .rain, time: .day), policy: policy,
+                                                           transitioning: false, meteorActive: false), 0)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: .preview(kind: .snow, time: .night), policy: policy,
+                                                           transitioning: false, meteorActive: false), 0)
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: .preview(kind: .thunderstorm, time: .night), policy: policy,
+                                                           transitioning: false, meteorActive: false), 0)
+        policy.showsWidgetGuide = true
+        XCTAssertEqual(WeatherRenderer.targetFrameInterval(scene: clearNight, policy: policy,
+                                                           transitioning: false, meteorActive: false), 0)
+    }
+
     func testMoonlitHazePreferencesAndUniformsStayCompatible() throws {
         var preferences = try JSONDecoder().decode(Preferences.self,from: JSONEncoder().encode(Preferences()))
         XCTAssertNil(preferences.notchHaze)

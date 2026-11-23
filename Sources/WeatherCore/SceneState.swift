@@ -116,4 +116,8 @@ public struct SceneTransition: Sendable {
         let t = Float(max(0, min(1, (time - beganAt) / max(0.001, duration))))
         return .interpolate(from: start, to: target, progress: t * t * (3 - 2 * t))
     }
+
+    public func isActive(at time: TimeInterval) -> Bool {
+        start != target && time - beganAt < duration
+    }
 }
