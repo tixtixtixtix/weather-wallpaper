@@ -10,11 +10,83 @@ final class WindowTests: XCTestCase {
         NSApplication.shared.setActivationPolicy(.prohibited)
         let model = AppModel()
         let host = NSHostingView(rootView: PreferencesView(model: model))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
+                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
         host.layoutSubtreeIfNeeded()
-        XCTAssertEqual(host.fittingSize.width,510,accuracy: 1)
-        XCTAssertEqual(host.fittingSize.height,650,accuracy: 1)
+        XCTAssertGreaterThanOrEqual(host.fittingSize.width, 660)
+        XCTAssertGreaterThanOrEqual(host.fittingSize.height, 480)
+        XCTAssertFalse(window.isRestorable)
         XCTAssertFalse(model.isFetching)
         XCTAssertFalse(model.wallpaperActive)
+        XCTAssertFalse(window.isVisible)
+        window.contentView = nil
+        window.close()
+    }
+
+    func testSettingsNavigationHistoryTracksBackForwardAndWidgetMutations() {
+        var history = SettingsNavigationHistory()
+        XCTAssertEqual(history.current, .general)
+        XCTAssertFalse(history.canGoBack)
+        XCTAssertFalse(history.canGoForward)
+
+        history.navigate(to: .general)
+        XCTAssertEqual(history.entries, [.general])
+
+        history.navigate(to: .playback)
+        history.navigate(to: .sky)
+        history.navigate(to: .notchHaze)
+        XCTAssertTrue(history.canGoBack)
+        XCTAssertFalse(history.canGoForward)
+
+        XCTAssertEqual(history.goBack(), .sky)
+        XCTAssertEqual(history.goBack(), .playback)
+        XCTAssertTrue(history.canGoForward)
+        XCTAssertEqual(history.goForward(), .sky)
+
+        // Navigating to a new pane trims forward history.
+        history.navigate(to: .widgetRain)
+        XCTAssertFalse(history.canGoForward)
+        XCTAssertEqual(history.entries, [.general, .playback, .sky, .widgetRain])
+
+        // Adding the first widget area replaces the empty placeholder cleanly.
+        history.didAddWidgetArea(at: 0, previousCount: 0)
+        XCTAssertEqual(history.current, .widgetArea(0))
+        XCTAssertEqual(history.entries, [.general, .playback, .sky, .widgetArea(0)])
+
+        // Adding a second widget area pushes it onto history.
+        history.didAddWidgetArea(at: 1, previousCount: 1)
+        XCTAssertEqual(history.current, .widgetArea(1))
+        XCTAssertEqual(history.goBack(), .widgetArea(0))
+        XCTAssertEqual(history.goForward(), .widgetArea(1))
+
+        // Removing Widget 1 shifts Widget 2 down to index 0 without invalid indices.
+        history.didRemoveWidgetArea(at: 0, remainingCount: 1)
+        XCTAssertEqual(history.current, .widgetArea(0))
+        XCTAssertEqual(history.entries, [.general, .playback, .sky, .widgetArea(0)])
+
+        // Removing the last remaining widget area returns to the empty Widget Rain pane.
+        history.didRemoveWidgetArea(at: 0, remainingCount: 0)
+        XCTAssertEqual(history.current, .widgetRain)
+        XCTAssertEqual(history.goBack(), .sky)
+        XCTAssertEqual(history.goForward(), .widgetRain)
+
+        // Removing all widget areas cleans every widget entry.
+        history.didAddWidgetArea(at: 0, previousCount: 0)
+        history.didAddWidgetArea(at: 1, previousCount: 1)
+        history.didRemoveAllWidgetAreas()
+        XCTAssertEqual(history.current, .widgetRain)
+        XCTAssertFalse(history.entries.contains { $0.widgetIndex != nil })
+    }
+
+    func testSettingsPaneSymbolsAndGeneralGearIconExist() {
+        XCTAssertEqual(SettingsPane.general.systemImage, "gear")
+        let panes: [SettingsPane] = [.general, .playback, .sky, .notchHaze, .widgetRain, .widgetArea(0)]
+        for pane in panes {
+            XCTAssertNotNil(NSImage(systemSymbolName: pane.systemImage, accessibilityDescription: nil),
+                            "Missing SF Symbol \(pane.systemImage) for \(pane.title)")
+        }
     }
 
     func testMoonlitHazePreferencesAndUniformsStayCompatible() throws {

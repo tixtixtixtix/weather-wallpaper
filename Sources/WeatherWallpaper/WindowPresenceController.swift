@@ -31,6 +31,15 @@ final class WindowPresenceController: NSObject {
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    static func showSettingsWindow(using openWindow: OpenWindowAction) {
+        openWindow(id: SettingsWindow.id)
+        NSApp.activate(ignoringOtherApps: true)
+        Task { @MainActor in
+            NSApp.activate(ignoringOtherApps: true)
+            SettingsWindow.window?.makeKeyAndOrderFront(nil)
+        }
+    }
 }
 
 struct MainWindowPresence: NSViewRepresentable {

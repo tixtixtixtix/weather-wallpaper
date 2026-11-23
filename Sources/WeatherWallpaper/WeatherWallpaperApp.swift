@@ -26,8 +26,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct WeatherWallpaperApp: App {
+struct WeatherWallpaperEntryPoint {
+    static func main() {
+        if #available(macOS 15.0, *) {
+            WeatherWallpaperModernApp.main()
+        } else {
+            WeatherWallpaperLegacyApp.main()
+        }
+    }
+}
+
+@available(macOS 15.0, *)
+private struct WeatherWallpaperModernApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+
+    var body: some Scene {
+        MainPreviewScene(delegate: delegate)
+
+        Window("Settings", id: SettingsWindow.id) {
+            PreferencesView(model: delegate.model)
+        }
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(width: 720, height: 580)
+        .windowResizability(.contentMinSize)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        WeatherMenuBarScene(model: delegate.model)
+    }
+}
+
+private struct WeatherWallpaperLegacyApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+
+    var body: some Scene {
+        MainPreviewScene(delegate: delegate)
+
+        Window("Settings", id: SettingsWindow.id) {
+            PreferencesView(model: delegate.model)
+        }
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(width: 720, height: 580)
+        .windowResizability(.contentMinSize)
+
+        WeatherMenuBarScene(model: delegate.model)
+    }
+}
+
+private struct MainPreviewScene: Scene {
+    let delegate: AppDelegate
 
     var body: some Scene {
         Window("Weather Wallpaper", id: "main") {
@@ -38,15 +85,17 @@ struct WeatherWallpaperApp: App {
         .defaultSize(width: 1060, height: 740)
         .windowResizability(.contentMinSize)
         .commands { WallpaperCommands() }
+    }
+}
 
-        Settings {
-            PreferencesView(model: delegate.model)
-        }
+private struct WeatherMenuBarScene: Scene {
+    let model: AppModel
 
+    var body: some Scene {
         MenuBarExtra {
-            WeatherMenuView(model: delegate.model)
+            WeatherMenuView(model: model)
         } label: {
-            WeatherMenuLabel(model: delegate.model)
+            WeatherMenuLabel(model: model)
         }
         .menuBarExtraStyle(.window)
     }
@@ -59,6 +108,10 @@ private struct WallpaperCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("Show Weather Wallpaper") { WindowPresenceController.showMainWindow(using: openWindow) }
                 .keyboardShortcut("0", modifiers: .command)
+        }
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") { WindowPresenceController.showSettingsWindow(using: openWindow) }
+                .keyboardShortcut(",", modifiers: .command)
         }
     }
 }

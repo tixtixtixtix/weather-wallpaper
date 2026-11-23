@@ -94,7 +94,8 @@ struct WeatherMenuView: View {
                         Button("Resume Wallpaper", action: model.resumeWallpaper)
                             .disabled(model.preferences.wallpaperSource == .live && !model.canApplyLive)
                     }
-                    SettingsLink { Text("Settings…") }
+                    Button("Settings…") { WindowPresenceController.showSettingsWindow(using: openWindow) }
+                        .keyboardShortcut(",", modifiers: .command)
                     Divider()
                     Button("Quit Weather Wallpaper") { NSApp.terminate(nil) }.keyboardShortcut("q")
                 } label: { Label("App Controls", systemImage: "ellipsis") }

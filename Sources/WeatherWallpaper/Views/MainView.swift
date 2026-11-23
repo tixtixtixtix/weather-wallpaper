@@ -184,7 +184,8 @@ struct MainView: View {
             Menu {
                 if model.wallpaperActive { Button("Remove Wallpaper", action: model.removeWallpaper) }
                 Button("Weather Diagnostics…") { diagnosticsPresented = true }
-                SettingsLink()
+                Button("Settings…") { WindowPresenceController.showSettingsWindow(using: openWindow) }
+                    .keyboardShortcut(",", modifiers: .command)
             } label: { Label("More", systemImage: "ellipsis") }
             Button { inspectorPresented.toggle() } label: { Label("Details", systemImage: "sidebar.right") }
                 .help("Show Details")
